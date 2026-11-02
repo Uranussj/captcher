@@ -341,10 +341,10 @@ class App:
         try:
             processed = preprocess(self.image)
             self.show(self.proc_label, Image.fromarray(processed))
-            text = neural_predict(self.image)
+            text = neural_predict(self.image) if self.use_neural.get() else None
             engine = "нейросеть"
             length_ok = True
-            if text is None:  # модели нет - работаем через Tesseract
+            if text is None:  # нейросеть выключена или модели нет - Tesseract
                 text, length_ok = recognize_best(self.image, alphabet, self.length.get())
                 engine = "Tesseract"
         except pytesseract.TesseractNotFoundError:
