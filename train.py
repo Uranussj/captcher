@@ -50,19 +50,30 @@ def to_tensor(img: Image.Image) -> torch.Tensor:
 # Данные
 # --------------------------------------------------------------------------
 class FolderDataset(Dataset):
-    """Картинки из папки; ответ - часть имени файла до первого '_'."""
+    """Картинки из папки; ответ - часть имени файла до первого '_'.
 
-    def __init__(self, folder: str, alphabet: str):
+    Если alphabet=None, набор символов определяется по именам файлов.
+    """
+
+    def __init__(self, folder: str, alphabet=None):
         exts = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
-        self.items = []
+        found = []
         for p in sorted(Path(folder).iterdir()):
-            if p.suffix.lower() not in exts:
-                continue
-            label = p.stem.split("_")[0]
-            if label and all(c in alphabet for c in label):
-                self.items.append((p, label))
+            if p.suffix.lower() in exts and p.stem.split("_")[0]:
+                found.append((p, p.stem.split("_")[0]))
+        if not found:
+            raise SystemExit(f"В папке {folder} нет картинок (формат имени: ОТВЕТ_что-угодно.png)")
+
+        if alphabet is None:
+            alphabet = "".join(sorted({c for _, label in found for c in label}))
+        self.alphabet = alphabet
+
+        self.items = [(p, l) for p, l in found if all(c in alphabet for c in l)]
+        skipped = len(found) - len(self.items)
+        if skipped:
+            print(f"ВНИМАНИЕ: пропущено {skipped} файлов - в ответе есть символы вне алфавита модели.")
         if not self.items:
-            raise SystemExit(f"В папке {folder} нет подходящих картинок (формат имени: ОТВЕТ_что-угодно.png)")
+            raise SystemExit("Не осталось подходящих картинок для обучения.")
 
     def __len__(self):
         return len(self.items)
@@ -194,21 +205,31 @@ def evaluate(model, loader, alphabet, device):
 
 def train(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    alphabet = args.alphabet
+    alphabet = args.alphabet  # None = определить по папке с примерами (или по умолчанию для synthetic)
 
-    model = CRNN(len(alphabet) + 1).to(device)
+    if args.synthetic and alphabet is None:
+        alphabet = DEFAULT_ALPHABET
+    full = None
+    if not args.synthetic:
+        full = FolderDataset(args.data, None if args.resume else alphabet)
+        if not args.resume:
+            alphabet = full.alphabet
+            print(f"Алфавит модели (из имён файлов): {alphabet}")
+
+    model = CRNN(len(alphabet) + 1).to(device) if alphabet else None
     if args.resume:  # дообучение: берём веса и алфавит из старой модели
         ckpt = torch.load(args.resume, map_location=device)
         alphabet = ckpt["alphabet"]
         model = CRNN(len(alphabet) + 1).to(device)
         model.load_state_dict(ckpt["state"])
-        print(f"Продолжаю обучение модели {args.resume}")
+        print(f"Продолжаю обучение модели {args.resume} (алфавит: {alphabet})")
+        if not args.synthetic:
+            full = FolderDataset(args.data, alphabet)  # заново, уже с алфавитом старой модели
 
     if args.synthetic:
         train_ds = SyntheticDataset(args.epoch_size, alphabet)
         val_ds = SyntheticDataset(500, alphabet, seed=123)
     else:
-        full = FolderDataset(args.data, alphabet)
         n_val = max(1, len(full) // 10)
         train_ds, val_ds = random_split(full, [len(full) - n_val, n_val])
         print(f"Картинок: {len(full)} (обучение {len(train_ds)}, проверка {len(val_ds)})")
@@ -256,7 +277,7 @@ def main():
     t.add_argument("--data", default="dataset", help="папка с размеченными картинками")
     t.add_argument("--synthetic", action="store_true", help="генерировать учебные капчи")
     t.add_argument("--epoch-size", type=int, default=5000, help="картинок за эпоху (synthetic)")
-    t.add_argument("--alphabet", default=DEFAULT_ALPHABET)
+    t.add_argument("--alphabet", default=None, help="допустимые символы (по умолчанию - из имён файлов)")
     t.add_argument("--epochs", type=int, default=20)
     t.add_argument("--batch", type=int, default=64)
     t.add_argument("--lr", type=float, default=1e-3)
