@@ -61,13 +61,22 @@ def locate_tesseract() -> bool:
 # --------------------------------------------------------------------------
 # Обработка и распознавание
 # --------------------------------------------------------------------------
-def preprocess(pil_img: Image.Image) -> np.ndarray:
-    """Делает из картинки чёрный текст на белом фоне."""
+def preprocess(pil_img: Image.Image, scale: int = 3, mode: str = "otsu") -> np.ndarray:
+    """Делает из картинки чёрный текст на белом фоне.
+
+    scale - во сколько раз увеличить картинку;
+    mode  - "otsu" (один общий порог) или "adaptive" (порог для каждого участка,
+            лучше при неровном фоне).
+    """
     rgb = np.array(pil_img.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     gray = cv2.medianBlur(gray, 3)
-    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if mode == "adaptive":
+        bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 31, 10)
+    else:
+        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if bw.mean() < 127:  # тёмный фон -> инвертируем
         bw = cv2.bitwise_not(bw)
     bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
@@ -75,9 +84,44 @@ def preprocess(pil_img: Image.Image) -> np.ndarray:
 
 
 def recognize(processed: np.ndarray, alphabet: str) -> str:
-    config = f"--oem 3 --psm 7 -c tessedit_char_whitelist={alphabet}"
+    # psm 8 = "одно слово": для капч точнее, чем psm 7 ("строка текста")
+    config = f"--oem 3 --psm 8 -c tessedit_char_whitelist={alphabet}"
     raw = pytesseract.image_to_string(processed, config=config)
     return re.sub(f"[^{re.escape(alphabet)}]", "", raw)
+
+
+def recognize_best(pil_img: Image.Image, alphabet: str, length: int = 0):
+    """Прогоняет несколько вариантов обработки и выбирает ответ голосованием.
+
+    Если задана длина, сначала рассматриваются только ответы нужной длины.
+    Возвращает (текст, совпала_ли_длина).
+    """
+    from collections import Counter
+
+    candidates = []
+    for scale in (2, 3, 4):
+        for mode in ("otsu", "adaptive"):
+            processed = preprocess(pil_img, scale, mode)
+            for psm in (7, 8):
+                config = f"--oem 3 --psm {psm} -c tessedit_char_whitelist={alphabet}"
+                raw = pytesseract.image_to_string(processed, config=config)
+                text = re.sub(f"[^{re.escape(alphabet)}]", "", raw)
+                if text:
+                    candidates.append(text)
+
+    if not candidates:
+        return "", False
+
+    if length:
+        exact = [c for c in candidates if len(c) == length]
+        if exact:
+            return Counter(exact).most_common(1)[0][0], True
+        # Нужной длины не нашлось - берём самый частый из ближайших по длине
+        closest = min(abs(len(c) - length) for c in candidates)
+        pool = [c for c in candidates if abs(len(c) - length) == closest]
+        return Counter(pool).most_common(1)[0][0], False
+
+    return Counter(candidates).most_common(1)[0][0], True
 
 
 _neural = {"mtime": None, "model": None}
@@ -210,21 +254,26 @@ class App:
         self.length = tk.IntVar(value=0)
         ttk.Spinbox(main, from_=0, to=20, textvariable=self.length, width=5).grid(row=8, column=1, sticky="w", pady=(8, 0))
 
-        ttk.Button(main, text="Распознать", command=self.run).grid(row=9, column=0, columnspan=2, pady=10, sticky="ew")
+        self.use_neural = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            main, text="Использовать нейросеть (model.pt)", variable=self.use_neural
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        ttk.Button(main, text="Распознать", command=self.run).grid(row=10, column=0, columnspan=2, pady=10, sticky="ew")
 
         # Результат
         self.result = tk.StringVar()
         ttk.Entry(main, textvariable=self.result, font=("Consolas", 20), justify="center").grid(
-            row=10, column=0, columnspan=2, sticky="ew"
+            row=11, column=0, columnspan=2, sticky="ew"
         )
-        ttk.Button(main, text="Копировать", command=self.copy).grid(row=11, column=0, columnspan=2, pady=(6, 0), sticky="ew")
+        ttk.Button(main, text="Копировать", command=self.copy).grid(row=12, column=0, columnspan=2, pady=(6, 0), sticky="ew")
 
         ttk.Button(main, text="Сохранить как пример для обучения", command=self.save_example).grid(
-            row=12, column=0, columnspan=2, pady=(6, 0), sticky="ew"
+            row=13, column=0, columnspan=2, pady=(6, 0), sticky="ew"
         )
 
         self.status = tk.StringVar(value="Выберите источник картинки")
-        ttk.Label(main, textvariable=self.status, foreground="gray").grid(row=13, column=0, columnspan=2, pady=(8, 0), sticky="w")
+        ttk.Label(main, textvariable=self.status, foreground="gray").grid(row=14, column=0, columnspan=2, pady=(8, 0), sticky="w")
 
     # ---- показ картинок -------------------------------------------------
     @staticmethod
@@ -294,8 +343,9 @@ class App:
             self.show(self.proc_label, Image.fromarray(processed))
             text = neural_predict(self.image)
             engine = "нейросеть"
+            length_ok = True
             if text is None:  # модели нет - работаем через Tesseract
-                text = recognize(processed, alphabet)
+                text, length_ok = recognize_best(self.image, alphabet, self.length.get())
                 engine = "Tesseract"
         except pytesseract.TesseractNotFoundError:
             messagebox.showerror(
@@ -313,7 +363,10 @@ class App:
         if not text:
             self.status.set("Текст не распознан. Попробуйте другой алфавит или картинку.")
         elif want and len(text) != want:
-            self.status.set(f"Распознано {len(text)} символов, ожидалось {want} - возможна ошибка.")
+            self.status.set(
+                f"Не удалось получить {want} символов ни в одном варианте обработки "
+                f"(лучший: {len(text)}). Проверьте результат вручную."
+            )
         else:
             self.status.set(f"Готово ({engine}).")
 
