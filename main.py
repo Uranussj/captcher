@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Captcha Reader - самостоятельное оконное приложение (без браузера).
@@ -22,6 +21,8 @@ import os
 import re
 import shutil
 import sys
+import uuid
+from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -32,6 +33,8 @@ from PIL import Image, ImageGrab, ImageTk
 
 DEFAULT_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 PREVIEW_SIZE = (380, 110)  # максимальный размер превью
+DATASET_DIR = Path("dataset")  # сюда сохраняются исправленные примеры
+MODEL_PATH = Path("model.pt")  # обученная нейросеть (создаётся train.py)
 
 
 # --------------------------------------------------------------------------
@@ -75,6 +78,24 @@ def recognize(processed: np.ndarray, alphabet: str) -> str:
     config = f"--oem 3 --psm 7 -c tessedit_char_whitelist={alphabet}"
     raw = pytesseract.image_to_string(processed, config=config)
     return re.sub(f"[^{re.escape(alphabet)}]", "", raw)
+
+
+_neural = {"mtime": None, "model": None}
+
+
+def neural_predict(pil_img: Image.Image):
+    """Распознаёт обученной моделью. Возвращает None, если модели нет или нет torch."""
+    if not MODEL_PATH.exists():
+        return None
+    try:
+        import train  # train.py должен лежать рядом
+    except ImportError:
+        return None
+    mtime = MODEL_PATH.stat().st_mtime
+    if _neural["mtime"] != mtime:  # модель обновилась (дообучение) - перечитываем
+        _neural["model"] = train.load_model(MODEL_PATH)
+        _neural["mtime"] = mtime
+    return train.predict(_neural["model"], pil_img)
 
 
 # --------------------------------------------------------------------------
@@ -198,8 +219,12 @@ class App:
         )
         ttk.Button(main, text="Копировать", command=self.copy).grid(row=11, column=0, columnspan=2, pady=(6, 0), sticky="ew")
 
+        ttk.Button(main, text="Сохранить как пример для обучения", command=self.save_example).grid(
+            row=12, column=0, columnspan=2, pady=(6, 0), sticky="ew"
+        )
+
         self.status = tk.StringVar(value="Выберите источник картинки")
-        ttk.Label(main, textvariable=self.status, foreground="gray").grid(row=12, column=0, columnspan=2, pady=(8, 0), sticky="w")
+        ttk.Label(main, textvariable=self.status, foreground="gray").grid(row=13, column=0, columnspan=2, pady=(8, 0), sticky="w")
 
     # ---- показ картинок -------------------------------------------------
     @staticmethod
@@ -267,7 +292,11 @@ class App:
         try:
             processed = preprocess(self.image)
             self.show(self.proc_label, Image.fromarray(processed))
-            text = recognize(processed, alphabet)
+            text = neural_predict(self.image)
+            engine = "нейросеть"
+            if text is None:  # модели нет - работаем через Tesseract
+                text = recognize(processed, alphabet)
+                engine = "Tesseract"
         except pytesseract.TesseractNotFoundError:
             messagebox.showerror(
                 "Tesseract не найден",
@@ -286,7 +315,19 @@ class App:
         elif want and len(text) != want:
             self.status.set(f"Распознано {len(text)} символов, ожидалось {want} - возможна ошибка.")
         else:
-            self.status.set("Готово.")
+            self.status.set(f"Готово ({engine}).")
+
+    def save_example(self):
+        """Сохраняет картинку с ответом из поля результата (его можно исправить вручную)."""
+        text = re.sub(r"[^A-Za-z0-9]", "", self.result.get())
+        if self.image is None or not text:
+            messagebox.showinfo("Нечего сохранять", "Нужны картинка и правильный ответ в поле результата.")
+            return
+        DATASET_DIR.mkdir(exist_ok=True)
+        path = DATASET_DIR / f"{text}_{uuid.uuid4().hex[:8]}.png"
+        self.image.convert("RGB").save(path)
+        count = len(list(DATASET_DIR.glob("*.png")))
+        self.status.set(f"Сохранено: {path.name} (всего примеров: {count})")
 
     def copy(self):
         text = self.result.get()
