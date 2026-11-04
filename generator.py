@@ -32,6 +32,27 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 WIDTH, HEIGHT = 220, 80
 DEFAULT_ALPHABET = string.ascii_letters + string.digits
+# Русский алфавит (без Ё/ё: на капчах она почти не встречается и путает разметку)
+RU_LETTERS = "АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюя"
+PRESETS = {
+    "en": DEFAULT_ALPHABET,
+    "en-letters": string.ascii_letters,
+    "digits": string.digits,
+    "ru": RU_LETTERS,
+    "ru-digits": RU_LETTERS + string.digits,
+}
+
+
+def script_mix(alphabet: str) -> bool:
+    """True, если в алфавите одновременно латиница и кириллица."""
+    cyr = any("\u0400" <= c <= "\u04ff" for c in alphabet)
+    lat = any(c.isascii() and c.isalpha() for c in alphabet)
+    return cyr and lat
+
+
+def is_ascii_alphabet(alphabet: str) -> bool:
+    return all(c.isascii() for c in alphabet)
+
 USER_FONTS_DIR = Path(__file__).resolve().parent / "fonts"
 
 SYSTEM_FONT_DIRS = [
@@ -63,15 +84,33 @@ LEVEL_NAMES = ["0 - чисто", "1 - лёгкая", "2 - средняя", "3 - 
 _font_cache = {}
 
 
+def glyph(font, ch: str) -> np.ndarray:
+    """Картинка символа в виде массива - чтобы сравнивать глифы между собой."""
+    img = Image.new("L", (80, 80), 0)
+    ImageDraw.Draw(img).text((10, 5), ch, font=font, fill=255)
+    return np.array(img)
+
+
 def font_is_usable(path: str, alphabet: str) -> bool:
-    """Шрифт подходит, если рисует все нужные символы (и отличает a от A)."""
+    """Шрифт подходит, если он рисует ВСЕ нужные символы.
+
+    Если символа в шрифте нет, вместо него рисуется "пустая рамка" (notdef) -
+    такие шрифты отбрасываются, иначе ответ в имени файла не совпал бы с картинкой.
+    Шрифты, где строчные буквы нарисованы как заглавные, тоже отбрасываются.
+    """
     try:
         font = ImageFont.truetype(path, 40)
+        notdef = glyph(font, "\uffff")
+        glyphs = {}
         for ch in alphabet:
-            if font.getmask(ch).getbbox() is None:  # символа в шрифте нет
+            g = glyph(font, ch)
+            if not g.any() or np.array_equal(g, notdef):
                 return False
-        if "a" in alphabet and "A" in alphabet and font.getbbox("a") == font.getbbox("A"):
-            return False  # шрифт только из заглавных - строчные буквы были бы "враньём"
+            glyphs[ch] = g
+        for ch, g in glyphs.items():
+            up = ch.upper()
+            if up != ch and up in glyphs and np.array_equal(g, glyphs[up]):
+                return False
         return True
     except Exception:
         return False
@@ -203,11 +242,21 @@ def save_sample(out_dir: Path, text: str, img: Image.Image) -> Path:
     return path
 
 
+def train_command(out_dir, alphabet: str) -> str:
+    """Готовая команда обучения. Для кириллицы алфавит берётся из имён файлов автоматически."""
+    cmd = f"python train.py train --data {out_dir} --epochs 30"
+    if is_ascii_alphabet(alphabet):
+        cmd += f' --alphabet "{alphabet}"'
+    return cmd
+
+
 # --------------------------------------------------------------------------
 # Режим без окна
 # --------------------------------------------------------------------------
 def run_cli(args) -> int:
-    alphabet = "".join(dict.fromkeys(args.alphabet))  # без повторов, порядок сохраняется
+    alphabet = "".join(dict.fromkeys(PRESETS[args.preset] if args.preset else args.alphabet))
+    if script_mix(alphabet):
+        print("ВНИМАНИЕ: в алфавите есть и латиница, и кириллица - похожие буквы (А/A, О/O, С/C) будут путаться.")
     fonts = find_fonts(alphabet, args.fonts)
     if not fonts:
         print("Не найдено подходящих шрифтов. Положите .ttf/.otf в папку fonts/ или укажите --fonts.")
@@ -222,7 +271,7 @@ def run_cli(args) -> int:
         if i % 250 == 0 or i == args.count:
             print(f"  {i}/{args.count}")
     print("Готово. Дальше:")
-    print(f'  python train.py train --data {args.out} --alphabet "{alphabet}" --epochs 30')
+    print(f"  {train_command(args.out, alphabet)}")
     return 0
 
 
@@ -246,6 +295,7 @@ def run_gui() -> int:
             self.current = None  # (текст, картинка)
             self.photo = None
             self.busy = False
+            self.mix_ok = set()  # алфавиты со смесью, которые пользователь уже подтвердил
 
             f = ttk.Frame(root, padding=12)
             f.grid()
@@ -264,9 +314,16 @@ def run_gui() -> int:
             ttk.Entry(f, textvariable=self.alphabet, width=60).grid(row=3, column=0, columnspan=3, sticky="ew")
             pre = ttk.Frame(f)
             pre.grid(row=4, column=0, columnspan=3, sticky="w", pady=2)
-            for name, val in (("Цифры", string.digits), ("Буквы", string.ascii_letters),
-                              ("Заглавные+цифры", string.ascii_uppercase + string.digits), ("Всё", DEFAULT_ALPHABET)):
-                ttk.Button(pre, text=name, command=lambda v=val: self.set_alphabet(v)).pack(side="left", padx=2)
+            row_en, row_ru = ttk.Frame(pre), ttk.Frame(pre)
+            row_en.pack(anchor="w")
+            row_ru.pack(anchor="w", pady=(2, 0))
+            for frame, items in (
+                (row_en, (("Цифры", string.digits), ("Буквы (лат.)", string.ascii_letters),
+                          ("Заглавные+цифры", string.ascii_uppercase + string.digits), ("Всё (лат.)", DEFAULT_ALPHABET))),
+                (row_ru, (("Русские буквы", RU_LETTERS), ("Русские+цифры", RU_LETTERS + string.digits))),
+            ):
+                for name, val in items:
+                    ttk.Button(frame, text=name, command=lambda v=val: self.set_alphabet(v)).pack(side="left", padx=2)
 
             row = ttk.Frame(f)
             row.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
@@ -329,6 +386,14 @@ def run_gui() -> int:
                 raise ValueError("Укажите допустимые символы.")
             if lo < 1 or hi < lo:
                 raise ValueError("Длина: «от» должно быть не меньше 1 и не больше «до».")
+            if script_mix(alphabet) and alphabet not in self.mix_ok:
+                if not messagebox.askyesno(
+                    "Латиница и кириллица вместе",
+                    "В алфавите есть и латинские, и русские буквы. Похожие символы (А/A, О/O, С/C, Р/P) "
+                    "нельзя различить на картинке, и модель будет путаться.\n\nВсё равно продолжить?",
+                ):
+                    raise ValueError("Выберите один алфавит: русские или латинские буквы.")
+                self.mix_ok.add(alphabet)
             return alphabet, lo, hi, self.level.current()
 
         def reload_fonts(self):
@@ -375,7 +440,8 @@ def run_gui() -> int:
                 self.reload_fonts()
             if not self.fonts:
                 messagebox.showwarning("Шрифты", "Нет подходящих шрифтов для этого набора символов.\n"
-                                       "Положите .ttf/.otf в папку fonts/ или выберите папку кнопкой.")
+                                       "Положите .ttf/.otf в папку fonts/ или выберите папку кнопкой.\n"
+                                       "Для русских букв нужны шрифты с кириллицей.")
                 return
             self.show(*generate_one(self.rng, self.fonts, alphabet, lo, hi, level))
 
@@ -394,7 +460,7 @@ def run_gui() -> int:
                 return
             self.reload_fonts()
             if not self.fonts:
-                messagebox.showwarning("Шрифты", "Нет подходящих шрифтов для этого набора символов.")
+                messagebox.showwarning("Шрифты", "Нет подходящих шрифтов для этого набора символов (для русских букв нужны шрифты с кириллицей).")
                 return
             self.batch = dict(done=0, total=total, alphabet=alphabet, lo=lo, hi=hi, level=level,
                               out=Path(self.out_dir.get()))
@@ -417,7 +483,7 @@ def run_gui() -> int:
                 self.set_busy(False)
                 self.status.set(
                     f"Готово: {b['total']} капч в «{b['out']}». Обучение:\n"
-                    f'python train.py train --data {b["out"]} --alphabet "{b["alphabet"]}" --epochs 30'
+                    f'{train_command(b["out"], b["alphabet"])}'
                 )
 
     root = tk.Tk()
@@ -431,7 +497,9 @@ def main() -> int:
     p.add_argument("--cli", action="store_true", help="работать без окна")
     p.add_argument("--count", type=int, default=2000)
     p.add_argument("--out", default="dataset_synth")
-    p.add_argument("--alphabet", default=DEFAULT_ALPHABET)
+    p.add_argument("--alphabet", default=DEFAULT_ALPHABET, help="свой набор символов")
+    p.add_argument("--preset", choices=sorted(PRESETS),
+                   help="готовый алфавит: en, en-letters, digits, ru (русские буквы), ru-digits")
     p.add_argument("--min-len", type=int, default=5)
     p.add_argument("--max-len", type=int, default=6)
     p.add_argument("--level", type=int, default=2, choices=sorted(LEVELS))

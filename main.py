@@ -33,6 +33,7 @@ from PIL import Image, ImageGrab, ImageTk
 
 DEFAULT_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 PREVIEW_SIZE = (380, 110)  # максимальный размер превью
+RU_LETTERS = "АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюя"
 DATASET_DIR = Path("dataset")  # сюда сохраняются исправленные примеры
 MODEL_PATH = Path("model.pt")  # обученная нейросеть (создаётся train.py)
 
@@ -83,10 +84,19 @@ def preprocess(pil_img: Image.Image, scale: int = 3, mode: str = "otsu") -> np.n
     return cv2.copyMakeBorder(bw, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=255)
 
 
+def ocr_lang(alphabet: str):
+    """Язык Tesseract по алфавиту: кириллица -> rus (нужен файл rus.traineddata)."""
+    has_cyr = any("а" <= c.lower() <= "я" or c.lower() == "ё" for c in alphabet)
+    has_lat = any("a" <= c.lower() <= "z" for c in alphabet)
+    if has_cyr and has_lat:
+        return "rus+eng"
+    return "rus" if has_cyr else None
+
+
 def recognize(processed: np.ndarray, alphabet: str) -> str:
     # psm 8 = "одно слово": для капч точнее, чем psm 7 ("строка текста")
     config = f"--oem 3 --psm 8 -c tessedit_char_whitelist={alphabet}"
-    raw = pytesseract.image_to_string(processed, config=config)
+    raw = pytesseract.image_to_string(processed, config=config, lang=ocr_lang(alphabet))
     return re.sub(f"[^{re.escape(alphabet)}]", "", raw)
 
 
@@ -104,7 +114,7 @@ def recognize_best(pil_img: Image.Image, alphabet: str, length: int = 0):
             processed = preprocess(pil_img, scale, mode)
             for psm in (7, 8):
                 config = f"--oem 3 --psm {psm} -c tessedit_char_whitelist={alphabet}"
-                raw = pytesseract.image_to_string(processed, config=config)
+                raw = pytesseract.image_to_string(processed, config=config, lang=ocr_lang(alphabet))
                 text = re.sub(f"[^{re.escape(alphabet)}]", "", raw)
                 if text:
                     candidates.append(text)
@@ -243,12 +253,23 @@ class App:
         # Быстрые пресеты алфавита
         presets = ttk.Frame(main)
         presets.grid(row=7, column=0, columnspan=2, sticky="w", pady=2)
-        for name, value in (
-            ("Цифры", "0123456789"),
-            ("Заглавные+цифры", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
-            ("Всё", DEFAULT_ALPHABET),
+        row_en = ttk.Frame(presets)
+        row_en.pack(anchor="w")
+        row_ru = ttk.Frame(presets)
+        row_ru.pack(anchor="w", pady=(2, 0))
+        for frame, items in (
+            (row_en, (
+                ("Цифры", "0123456789"),
+                ("Заглавные+цифры", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
+                ("Всё (лат.)", DEFAULT_ALPHABET),
+            )),
+            (row_ru, (
+                ("Русские буквы", RU_LETTERS),
+                ("Русские+цифры", RU_LETTERS + "0123456789"),
+            )),
         ):
-            ttk.Button(presets, text=name, command=lambda v=value: self.alphabet.set(v)).pack(side="left", padx=2)
+            for name, value in items:
+                ttk.Button(frame, text=name, command=lambda v=value: self.alphabet.set(v)).pack(side="left", padx=2)
 
         ttk.Label(main, text="Ожидаемая длина (0 = любая):").grid(row=8, column=0, sticky="w", pady=(8, 0))
         self.length = tk.IntVar(value=0)
@@ -355,7 +376,11 @@ class App:
             )
             return
         except Exception as exc:
-            messagebox.showerror("Ошибка", str(exc))
+            hint = ""
+            if "rus" in str(exc).lower():
+                hint = ("\n\nДля русских букв нужны языковые данные Tesseract: при установке отметьте Russian "
+                        "или скачайте rus.traineddata в папку tessdata.")
+            messagebox.showerror("Ошибка", str(exc) + hint)
             return
 
         self.result.set(text)
@@ -372,7 +397,7 @@ class App:
 
     def save_example(self):
         """Сохраняет картинку с ответом из поля результата (его можно исправить вручную)."""
-        text = re.sub(r"[^A-Za-z0-9]", "", self.result.get())
+        text = re.sub(r"[^A-Za-z0-9А-Яа-яЁё]", "", self.result.get())
         if self.image is None or not text:
             messagebox.showinfo("Нечего сохранять", "Нужны картинка и правильный ответ в поле результата.")
             return
